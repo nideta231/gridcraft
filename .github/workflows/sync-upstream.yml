@@ -1,0 +1,22 @@
+# Keeps `main` an exact mirror of storytold/gridcraft. The Android work lives on `android`,
+# which is rebased onto a new upstream release by hand (see .github/README.md → Branches and syncing).
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fast-forward main from upstream
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          gh repo sync "$GITHUB_REPOSITORY" --branch main --source storytold/gridcraft \
+            || echo "::warning::Sync failed (upstream may have changed workflow files; GITHUB_TOKEN cannot push those). Use the GitHub 'Sync fork' button or add a SYNC_TOKEN secret with the workflow scope."

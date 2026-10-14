@@ -1170,14 +1170,17 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                     d.values.insert("path".into(), json!(path.clone()));
                     ok_cancel(ui, &mut confirm, &mut open);
                     if confirm {
-                        let target = if path.is_empty() { app.services.pick_save.as_ref().and_then(|f| f(&format!("Copy.{fmt}"))) } else { Some(path) };
-                        if let Some(t) = target {
-                            let id = match fmt.as_str() {
-                                "csv" => "file.exportCsv",
-                                "html" => "file.exportHtml",
-                                _ => "file.saveAs",
-                            };
-                            app.run_or_alert(id, json!({"path": t}));
+                        let id = match fmt.as_str() {
+                            "csv" => "file.exportCsv",
+                            "html" => "file.exportHtml",
+                            _ => "file.saveAs",
+                        };
+                        if path.is_empty() {
+                            // Nothing typed: ask, and write the copy when the answer arrives.
+                            let fmt = fmt.clone();
+                            app.ask_save(&format!("Copy.{fmt}"), move |app, t| app.run_or_alert(id, json!({"path": t})));
+                        } else {
+                            app.run_or_alert(id, json!({"path": path}));
                         }
                     }
                 }

@@ -669,8 +669,10 @@ fn save_as(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcom
         });
     });
     ui.add_space(14.0);
-    // Desktop: the system Save dialog. Web: the file downloads.
-    let web = app.services.pick_save.is_none() && app.services.download.is_some();
+    // Desktop: the system Save dialog. Web, and Android: we have one and the file is written
+    // where it says. Only a host with no save dialog at all downloads, so the button says
+    // what it will actually do.
+    let web = app.services.pick_save.is_none() && app.services.pick_save_async.is_none() && app.services.download.is_some();
     let label = if web { format!("{} (.{fmt})", lang.tr("Download")) } else { lang.tr("Browse…").to_string() };
     if square_button(ui, Icon::OpenFolder, &label).clicked() && app.commit_edit(0, 0, false, false) {
         if fmt == "xlsx" {
@@ -881,17 +883,19 @@ pub fn export_as(app: &mut SheetApp, fmt: &str) -> bool {
     };
     let title = app.session.active().map(|d| d.display_title()).unwrap_or_else(|| "Book1".into());
     let stem = std::path::Path::new(&title).file_stem().and_then(|s| s.to_str()).unwrap_or("Book1").to_string();
-    if let Some(pick) = &app.services.pick_save {
-        let Some(path) = pick(&format!("{stem}.{fmt}")) else { return false };
+    // A host with a save dialog is asked for a path and writes on the frame the answer arrives, so
+    // this reports "handed over" rather than "written". The workbook is untouched either way: an
+    // export is a copy, and it must not become the workbook's own file (`save_dialogs`).
+    let fmt_owned = fmt.to_string();
+    let asked = app.ask_save(&format!("{stem}.{fmt}"), move |app, path| {
         // The picker may suggest a workbook extension; the export writes the chosen format.
-        let path = std::path::Path::new(&path).with_extension(fmt).to_string_lossy().into_owned();
-        return match app.run(id, json!({"path": path})) {
-            Ok(_) => true,
-            Err(e) => {
-                app.message = Some(("GridCraft".into(), crate::clean_error(&e)));
-                false
-            }
-        };
+        let path = std::path::Path::new(path).with_extension(&fmt_owned).to_string_lossy().into_owned();
+        if let Err(e) = app.run(id, json!({"path": path})) {
+            app.message = Some(("GridCraft".into(), crate::clean_error(&e)));
+        }
+    });
+    if asked {
+        return true;
     }
     if app.services.download.is_none() {
         app.message = Some(("GridCraft".into(), "Exporting needs a file picker, which this window doesn't have.".into()));

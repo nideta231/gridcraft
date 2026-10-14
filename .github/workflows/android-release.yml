@@ -1,0 +1,72 @@
+# Android release for the unofficial GridCraft port (branch `android`).
+# Push a tag like `v0.7.0-android.1` (or run it by hand) to build, sign and publish the APK.
+name: Android release
+
+on:
+  push:
+    tags: ["v*-android.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust + Android target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android
+
+      - name: cargo-apk
+        run: cargo install cargo-apk --locked --version 0.10.0
+
+      - name: Keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          test -n "$KEYSTORE_B64" || { echo "::error::ANDROID_KEYSTORE_B64 secret is missing"; exit 1; }
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+
+      - name: Build signed APK
+        env:
+          CARGO_APK_ANDROID_KEYSTORE: ${{ runner.temp }}/release.jks
+          CARGO_APK_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export ANDROID_NDK_ROOT="$ANDROID_NDK_LATEST_HOME"
+          cd apps/gridcraft-android
+          cargo apk build --profile android
+          cd "$GITHUB_WORKSPACE"
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = tag ] || VERSION="dev-${GITHUB_SHA::7}"
+          mkdir -p dist
+          cp target/android/apk/gridcraft.apk "dist/gridcraft-$VERSION-arm64-v8a.apk"
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gridcraft-android
+          path: dist/*
+
+      - name: GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release exists (published from a tested local build); leaving its assets alone."; exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "GridCraft for Android (Unofficial) $GITHUB_REF_NAME" \
+            --notes-file .github/android-release-notes.md

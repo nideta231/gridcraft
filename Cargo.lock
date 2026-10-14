@@ -1517,6 +1517,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gridcraft-android"
+version = "0.7.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "gridcraft-engine",
+ "gridcraft-ui-egui",
+ "jni",
+ "log",
+ "serde_json",
+ "winit",
+]
+
+[[package]]
 name = "gridcraft-calc"
 version = "0.7.0"
 dependencies = [

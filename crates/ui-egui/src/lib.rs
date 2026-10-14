@@ -28,6 +28,7 @@ pub mod paper_view;
 pub mod pivot_pane;
 pub mod printing;
 pub mod ribbon;
+mod save_dialogs;
 pub mod selection_glide;
 pub mod tabs;
 pub mod text_box;
@@ -170,6 +171,12 @@ pub struct Services {
     pub print_native: Option<printing::Submit>,
     pub pick_open: Option<Box<dyn Fn() -> Option<String>>>,
     pub pick_save: Option<Box<dyn Fn(&str) -> Option<String>>>,
+    /// A save dialog whose answer arrives later: what `pick_save` is for a host that cannot show a
+    /// panel without ending the frame — the browser, and Android, where the picker is drawn with
+    /// egui between frames. The host returns a receiver and the app runs what asked on the frame
+    /// the path arrives ([`save_dialogs`]); an empty answer is a cancellation. A host with this
+    /// must be preferred over handing it finished bytes, which cannot tell the app where they went.
+    pub pick_save_async: Option<Box<dyn Fn(&str) -> std::sync::mpsc::Receiver<Option<String>>>>,
     /// Native picture picker (PNG/JPEG), separate from workbook opening.
     pub pick_picture: Option<Box<dyn Fn() -> Option<String>>>,
     /// Browser picture picker. Each dialog owns its inbox, so canceled picks cannot
@@ -225,6 +232,8 @@ pub struct SheetApp {
     pub services: Services,
     pub printing: printing::State,
     print_feedback_seen: Option<printing::Feedback>,
+    /// The save dialog the host is showing, and what to do with its answer ([`save_dialogs`]).
+    pending_save: Option<save_dialogs::PendingSave>,
     /// Synthetic input from agents, one batch per frame (drags need several frames).
     pub synthetic: std::collections::VecDeque<Vec<egui::Event>>,
     pub control_rx: Option<std::sync::mpsc::Receiver<ControlRequest>>,
@@ -281,6 +290,7 @@ impl SheetApp {
             services,
             printing: Default::default(),
             print_feedback_seen: None,
+            pending_save: None,
             synthetic: Default::default(),
             control_rx: None,
             grid: grid::GridState {
@@ -706,6 +716,18 @@ impl SheetApp {
                 }
             }
         }
+        // A workbook that now has a file of its own — just saved, or opened — belongs at the top of
+        // the recent list. `open_path` does this for opening, and nothing did it for saving: a
+        // workbook saved with Save As never appeared in Recent, so the only way back to it was to
+        // find it by hand. Only when it is not already first, so the list stays a list of files
+        // rather than of whatever is on screen.
+        if let Some(path) = self.session.active().and_then(|d| d.path.clone())
+            && self.ui.recent.first() != Some(&path)
+        {
+            self.ui.recent.retain(|p| *p != path);
+            self.ui.recent.insert(0, path);
+            self.ui.recent.truncate(20);
+        }
     }
 
     pub fn open_dialog(&mut self, name: &str, params: Json) {
@@ -725,12 +747,16 @@ impl SheetApp {
             }
             "saveAs" => {
                 let suggested = self.session.active().map(|d| d.display_title()).unwrap_or_else(|| "Book1".into());
-                if let Some(pick) = &self.services.pick_save {
-                    if let Some(path) = pick(&suggested) {
-                        let path = if std::path::Path::new(&path).extension().is_none() { format!("{path}.xlsx") } else { path };
-                        self.run_or_alert("file.save", json!({"path": path}));
-                    }
-                } else if self.services.download.is_some()
+                // A host with a save dialog gets the path back, so the workbook learns which file it
+                // is: the title bar follows, `file.save` stops asking, and closing stops prompting.
+                // Only a host with neither a blocking nor an asynchronous dialog falls through to
+                // the bytes below, which cannot name what they wrote (`save_dialogs`).
+                let asked = self.ask_save(&suggested, |app, path| {
+                    let path = if std::path::Path::new(path).extension().is_none() { format!("{path}.xlsx") } else { path.to_string() };
+                    app.run_or_alert("file.save", json!({"path": path}));
+                });
+                if !asked
+                    && self.services.download.is_some()
                     && let Ok(r) = self.run("file.saveBytes", json!({"format": "xlsx"}))
                     && let Some(dl) = &self.services.download
                     && let Some(b) = r.get("base64").and_then(Json::as_str).and_then(gridcraft_engine::io::base64_decode)
@@ -1055,6 +1081,8 @@ impl SheetApp {
             ctx.set_zoom_factor(zoom);
             ctx.request_repaint();
         }
+        // A save dialog that answered between frames: what asked runs now, with the path.
+        self.poll_save();
         control::poll(self, ctx);
         // Files read asynchronously (web file picker, dropped files).
         let arrived: Vec<(String, Vec<u8>)> = self

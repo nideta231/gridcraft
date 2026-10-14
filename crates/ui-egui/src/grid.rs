@@ -2115,6 +2115,12 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
             }
         } else if mods.command {
             select_ranges(app, RangeRef::cell(c), true, c);
+        } else if primary_clicked && app.session.format_painter.is_some() {
+            // The Format Painter is only *picked up* by the ribbon — nothing ever delivered the
+            // format to a cell, so the tool was dead. A plain click lands it on the cell the click
+            // hit (Excel paints on the click); the engine still owns the tiling and the clearing.
+            // Shift and Command clicks above extend the selection and never reach this branch.
+            app.run_or_alert("edit.formatPainter", json!({"apply": c.a1()}));
         } else {
             let _ = app.session.run("selection.set", json!({"cell": c.a1()}));
             if primary_clicked && wb.styles.get(sh.style_id(c)).num_fmt.as_str() == "checkbox" {
@@ -2261,6 +2267,15 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
             Drag::Select if resp.drag_stopped() => {
                 if let Some(p) = pos {
                     select_to_pointer(app, geo, sh, wb, p);
+                }
+                // Excel delivers the Format Painter on mouse-up over the whole dragged range; the
+                // ribbon only picks it up, so a drag has to paint it here. Not while editing, where
+                // a select-drag is point mode for a formula reference, not a paint.
+                if app.editor.is_none()
+                    && app.session.format_painter.is_some()
+                    && let Some(target) = app.session.active().map(|d| d.selection.current().a1())
+                {
+                    app.run_or_alert("edit.formatPainter", json!({"apply": target}));
                 }
             }
             Drag::Fill { target: Some(t) } => {
