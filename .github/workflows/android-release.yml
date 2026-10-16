@@ -37,6 +37,14 @@ jobs:
           test -n "$KEYSTORE_B64" || { echo "::error::ANDROID_KEYSTORE_B64 secret is missing"; exit 1; }
           echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
 
+      - name: Tag matches PORT_VERSION
+        if: github.ref_type == 'tag'
+        run: |
+          crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          rev=$(grep -o 'android\.[0-9]*")' apps/gridcraft-android/src/lib.rs | head -n 1 | tr -d '")')
+          want="v$crate-$rev"
+          [ "$GITHUB_REF_NAME" = "$want" ] || { echo "::error::tag $GITHUB_REF_NAME but the app says $want (PORT_VERSION in apps/gridcraft-android/src/lib.rs)"; exit 1; }
+
       - name: Build signed APK
         env:
           CARGO_APK_ANDROID_KEYSTORE: ${{ runner.temp }}/release.jks

@@ -96,6 +96,10 @@ version = 1
 # hand in Settings ▸ Apps ▸ GridCraft ▸ Special access. Play restricts it to file-manager-class
 # apps, which does not apply to a sideloaded build. Save needs it too, to write outside the app's
 # own folder.
+# The update check asks api.github.com for the latest release (src/update_check.rs).
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
 [[package.metadata.android.uses_permission]]
 name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 

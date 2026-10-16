@@ -34,7 +34,8 @@ Android-specific work, on top of the unmodified upstream engine:
 - **"Open with" / "Share" from other apps** — tap a file in Files, WhatsApp, Telegram or Gmail and pick GridCraft; it opens straight in, no permission needed.
 - **System clipboard** — copy cells in GridCraft, paste into WhatsApp/Docs/Sheets, and back (plain text + HTML so numbers stay numbers).
 - **Links open in the browser** (About, Backstage, Help).
-- **Touch**: two-finger drag scrolls, pinch zooms; Shift/Ctrl from a hardware keyboard work (Android sends no modifier events — the shell tracks them).
+- **Update banner**: on start (and on return, at most every 30 min) the app asks GitHub for this fork's latest release; if newer, a banner offers **Download** / **What's new** / **Later**. Needs internet only for this; nothing is installed automatically.
+- **Touch**: one finger taps and drag-selects; **two-finger drag scrolls in any direction** (vertical, horizontal, diagonal, with a coasting flick); pinch zooms. The first finger's press waits ~0.14 s for a second finger, so a scroll never starts a selection; Shift/Ctrl from a hardware keyboard work (Android sends no modifier events — the shell tracks them).
 - **Built-in file picker** with Downloads/Documents/app-folder roots; Save remembers the file so Ctrl+S saves silently afterwards.
 - **Preferences and recent files survive** a swipe-away from Recents (written while the app runs — Android never says goodbye).
 - **Edge-to-edge fullscreen**, survives rotation, split-screen and keyboard attach without restarting the Activity.

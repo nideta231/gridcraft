@@ -1,67 +1,69 @@
 //! Two-finger scrolling for the shell: the platform sends touches, the apps want a wheel.
 //!
-//! # The gap
+//! winit's Android backend has no mouse and emits no wheel events. Touch arrives as
+//! `egui::Event::Touch`, and egui-winit *also* turns the first finger into an emulated mouse
+//! (`PointerButton` + `PointerMoved`), so one finger drags a selection and the page never moves.
 //!
-//! Every app in this suite scrolls from `egui::Event::MouseWheel`. WordCraft's `scroll.rs` is
-//! explicit about what it expects — pixel deltas move the page 1:1, `TouchPhase::End` on the last
-//! event is the "fingers lifted" signal that starts the kinetic coast — and it is written for a
-//! *touch* device: it handles phases, synthesises momentum where the platform does not, and takes
-//! wheel notches as three lines. None of that ever runs on Android, because winit's Android backend
-//! has no mouse and therefore emits no wheel events at all (`src/platform_impl/android/mod.rs` sends
-//! six window events and a wheel is not one of them). Touch arrives as `WindowEvent::Touch`, which
-//! egui-winit forwards as `egui::Event::Touch` *and* turns into an emulated mouse pointer — so a
-//! finger drags a selection, and the page never moves. Exactly the complaint a tablet user makes.
+//! This turns a **two-finger drag** (any direction: vertical, horizontal or diagonal) into
+//! `MouseWheel` events in points, ending with `TouchPhase::End` so the apps coast to a stop, and
+//! keeps one finger for selecting:
 //!
-//! # What this does
+//! - **The first finger's press is held back** for [`HOLD`] (or until it moves [`SLOP`] points,
+//!   or lifts). Fingers of a two-finger gesture land a few milliseconds apart; without the hold
+//!   the first one would already have started a selection drag by the time the second arrives.
+//!   A tap still selects at once (the press and release go out together on lift), and a drag
+//!   starts after at most [`HOLD`].
+//! - **A second finger cancels the one-finger drag.** When it lands after the press already went
+//!   out (a slow second finger), a release is sent at the first finger's last position so the
+//!   selection drag ends where it was.
+//! - **During the gesture, and until every finger is up**, the emulated pointer's buttons and
+//!   moves are dropped: nothing follows the fingers but the page. The pointer stays where the
+//!   gesture started, over the canvas, which is where the apps accept wheel input.
 //!
-//! Turns a **two-finger drag** into wheel events and leaves one finger alone:
+//! The touch events themselves stay in the batch, so egui's pinch (`zoom_delta`) still zooms.
 //!
-//! - one finger: untouched, so dragging still selects text — the emulated pointer works as before;
-//! - two or more fingers: the centroid's movement becomes `Event::MouseWheel` with
-//!   `MouseWheelUnit::Point` and `TouchPhase::Move`, and a final `TouchPhase::End` event when the
-//!   fingers lift, which is what makes the apps coast to a stop;
-//! - while a two-finger gesture is live the emulated **pointer button** events are dropped, or the
-//!   first finger would drag a selection across the page at the same time as it scrolled. The
-//!   pointer *position* events are kept: the apps only scroll while the pointer is over the canvas.
-//!
-//! The touch events themselves are left in the batch — egui's pinch handling (`zoom_delta`) reads
-//! them and the apps zoom with it, so a pinch keeps working and a two-finger *pan* moves nothing but
-//! the page.
-//!
-//! Two fingers is the convention a tablet user already knows from every document viewer, and it
-//! needs nothing from inside the apps: as far as their scroll code is concerned, a touchpad moved.
-//!
-//! Call [`TouchScroll::apply`] from the shell's `eframe::App::raw_input_hook`, after the modifier
-//! tracking, whose reported state the wheel event has to carry (Ctrl+wheel zooms).
+//! Call [`TouchScroll::apply`] from the shell's `raw_input_hook`, after the modifier tracking,
+//! and repaint after [`TouchScroll::repaint_after`] so a held press goes out without new input.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-/// Touch state between frames: where each finger is (a scroll is a *change* of position and a batch
-/// only carries the new one), and how far the last scroll was measured from.
+/// How long a lone finger's press is held back waiting for a second finger.
+pub const HOLD: Duration = Duration::from_millis(140);
+/// How far (points) a lone finger may move before its press goes out anyway.
+pub const SLOP: f32 = 14.0;
+
 #[derive(Debug, Default)]
 pub struct TouchScroll {
-    /// Keyed by the raw id: `egui::TouchId` is a `u64` newtype with no `Hash`,
-    /// so it cannot be a map key itself.
+    /// Keyed by the raw id (`egui::TouchId` has no `Hash`).
     fingers: HashMap<u64, egui::Pos2>,
-    /// The centroid the last scroll was measured from. `None` outside a gesture, so the moment a
-    /// second finger lands — which moves the centroid by half the gap between the fingers — is not
-    /// itself a scroll.
+    /// The centroid the last scroll was measured from; `None` outside a gesture.
     last: Option<egui::Pos2>,
-    /// A two-finger gesture has scrolled and has not ended: the apps are coasting on the last
-    /// `TouchPhase::End` and must be told when this one finishes.
+    /// A gesture has scrolled and not yet ended.
     scrolling: bool,
+    /// The lone finger's press, held back: (event, when it came, where the finger started).
+    held: Option<(egui::Event, Instant, egui::Pos2)>,
+    /// The emulated pointer's press went out and has not been released.
+    pressed: bool,
+    /// The emulated pointer's last position.
+    pointer: Option<egui::Pos2>,
+    /// A gesture happened since the hand was last fully off the screen: keep the pointer quiet.
+    quiet: bool,
 }
 
 impl TouchScroll {
-    /// Rewrite one frame's events so the apps can scroll from them.
-    ///
-    /// `modifiers` is the shell's tracked state, because egui reads the zoom modifier from the event
-    /// itself (and the platform never reports modifiers — see `modifiers.rs`).
+    /// Rewrite one frame's events.
     pub fn apply(&mut self, raw: &mut egui::RawInput, modifiers: egui::Modifiers) {
-        let events = std::mem::take(&mut raw.events);
+        self.apply_at(raw, modifiers, Instant::now());
+    }
 
-        // First the finger bookkeeping, over the whole batch: the events of one frame arrive in
-        // order, and the delta wanted is between this frame's centroid and the last one.
+    /// When to look again without new input: a held press is waiting for its timeout.
+    pub fn repaint_after(&self) -> Option<Duration> {
+        self.held.as_ref().map(|(_, at, _)| HOLD.saturating_sub(at.elapsed()) + Duration::from_millis(5))
+    }
+
+    fn apply_at(&mut self, raw: &mut egui::RawInput, modifiers: egui::Modifiers, now: Instant) {
+        let events = std::mem::take(&mut raw.events);
         for event in &events {
             if let egui::Event::Touch { id, phase, pos, .. } = event {
                 match phase {
@@ -74,49 +76,89 @@ impl TouchScroll {
                 }
             }
         }
-
-        let centroid = self.centroid();
         let gesture = self.fingers.len() >= 2;
-        // Positive is "the content moves down/right", which is what egui documents and what a finger
-        // dragged down the screen means.
+        let centroid = self.centroid();
         let delta = match (gesture, centroid, self.last) {
             (true, Some(now), Some(prev)) => now - prev,
             _ => egui::Vec2::ZERO,
         };
 
-        let mut out = Vec::with_capacity(events.len() + 1);
-        for event in events {
-            if gesture && matches!(event, egui::Event::PointerButton { .. }) {
-                continue;
+        let mut out = Vec::with_capacity(events.len() + 2);
+        if gesture && !self.quiet {
+            // The gesture starts: whatever the first finger began is called off.
+            self.quiet = true;
+            self.held = None;
+            if self.pressed {
+                if let Some(pos) = self.pointer {
+                    out.push(release(pos, modifiers));
+                }
+                self.pressed = false;
             }
-            out.push(event);
+        }
+
+        for event in events {
+            match &event {
+                egui::Event::PointerMoved(pos) => {
+                    if self.quiet {
+                        continue;
+                    }
+                    self.pointer = Some(*pos);
+                    out.push(event.clone());
+                    // Moving far enough means a drag, not the start of a two-finger gesture.
+                    if let Some((_, _, start)) = &self.held
+                        && (*pos - *start).length() > SLOP
+                    {
+                        let (press, _, _) = self.held.take().expect("checked above");
+                        out.insert(out.len() - 1, press);
+                        self.pressed = true;
+                    }
+                }
+                egui::Event::PointerButton { pressed, pos, .. } => {
+                    if self.quiet {
+                        continue;
+                    }
+                    if *pressed {
+                        self.held = Some((event.clone(), now, *pos));
+                    } else {
+                        // A tap: the held press goes out right before its release.
+                        if let Some((press, _, _)) = self.held.take() {
+                            out.push(press);
+                        }
+                        out.push(event.clone());
+                        self.pressed = false;
+                    }
+                }
+                _ => out.push(event),
+            }
+        }
+
+        // The hold ran out with the finger still down and alone: it is a drag (or long press).
+        if let Some((_, at, _)) = &self.held
+            && now.duration_since(*at) >= HOLD
+            && !gesture
+        {
+            let (press, _, _) = self.held.take().expect("checked above");
+            out.push(press);
+            self.pressed = true;
         }
 
         if gesture && delta != egui::Vec2::ZERO {
             self.scrolling = true;
-            out.push(egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Point,
-                delta,
-                phase: egui::TouchPhase::Move,
-                modifiers,
-            });
+            out.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, phase: egui::TouchPhase::Move, modifiers });
         } else if self.scrolling && !gesture {
-            // The fingers lifted. The apps' momentum code coasts from this, and a flick that was
-            // fast enough keeps the page moving after the hand is off it.
             self.scrolling = false;
-            out.push(egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Point,
-                delta: egui::Vec2::ZERO,
-                phase: egui::TouchPhase::End,
-                modifiers,
-            });
+            out.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::ZERO, phase: egui::TouchPhase::End, modifiers });
         }
 
         self.last = if gesture { centroid } else { None };
+        if self.fingers.is_empty() {
+            self.quiet = false;
+            self.held = None;
+            self.pressed = false;
+        }
         raw.events = out;
     }
 
-    /// Where the fingers are, on average. `None` with none down.
     fn centroid(&self) -> Option<egui::Pos2> {
         let n = self.fingers.len();
         if n == 0 {
@@ -127,28 +169,23 @@ impl TouchScroll {
     }
 }
 
+fn release(pos: egui::Pos2, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn touch(id: u64, phase: egui::TouchPhase, x: f32, y: f32) -> egui::Event {
-        egui::Event::Touch {
-            device_id: egui::TouchDeviceId(0),
-            id: egui::TouchId::from(id),
-            phase,
-            pos: egui::pos2(x, y),
-            force: None,
-        }
+        egui::Event::Touch { device_id: egui::TouchDeviceId(0), id: egui::TouchId::from(id), phase, pos: egui::pos2(x, y), force: None }
     }
-
     fn moved(x: f32, y: f32) -> egui::Event {
         egui::Event::PointerMoved(egui::pos2(x, y))
     }
-
-    fn press(x: f32, y: f32) -> egui::Event {
-        egui::Event::PointerButton { pos: egui::pos2(x, y), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }
+    fn button(x: f32, y: f32, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos: egui::pos2(x, y), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }
     }
-
     fn wheels(raw: &egui::RawInput) -> Vec<(egui::Vec2, egui::TouchPhase)> {
         raw.events
             .iter()
@@ -158,74 +195,103 @@ mod tests {
             })
             .collect()
     }
-
+    fn presses(raw: &egui::RawInput) -> Vec<bool> {
+        raw.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::PointerButton { pressed, .. } => Some(*pressed),
+                _ => None,
+            })
+            .collect()
+    }
     fn batch(events: Vec<egui::Event>) -> egui::RawInput {
         egui::RawInput { events, ..Default::default() }
     }
+    fn ms(t0: Instant, n: u64) -> Instant {
+        t0 + Duration::from_millis(n)
+    }
 
     #[test]
-    fn one_finger_still_selects_and_never_scrolls() {
-        let mut s = TouchScroll::default();
-        let mut raw = batch(vec![touch(1, egui::TouchPhase::Start, 100.0, 100.0), moved(100.0, 100.0), press(100.0, 100.0)]);
-        s.apply(&mut raw, Default::default());
-        assert!(
-            raw.events.iter().any(|e| matches!(e, egui::Event::PointerButton { pressed: true, .. })),
-            "one finger keeps its press: that is how a tablet drags a selection"
-        );
+    fn a_tap_selects() {
+        let (mut s, t0) = (TouchScroll::default(), Instant::now());
+        let mut raw = batch(vec![touch(1, egui::TouchPhase::Start, 100.0, 100.0), moved(100.0, 100.0), button(100.0, 100.0, true)]);
+        s.apply_at(&mut raw, Default::default(), t0);
+        assert!(presses(&raw).is_empty(), "the press is held back for a moment");
+        let mut raw = batch(vec![touch(1, egui::TouchPhase::End, 100.0, 100.0), button(100.0, 100.0, false), egui::Event::PointerGone]);
+        s.apply_at(&mut raw, Default::default(), ms(t0, 60));
+        assert_eq!(presses(&raw), vec![true, false], "on lift the press and release go out together: a click");
+    }
+
+    #[test]
+    fn one_finger_drag_still_selects() {
+        let (mut s, t0) = (TouchScroll::default(), Instant::now());
+        s.apply_at(&mut batch(vec![touch(1, egui::TouchPhase::Start, 100.0, 100.0), moved(100.0, 100.0), button(100.0, 100.0, true)]), Default::default(), t0);
         let mut raw = batch(vec![touch(1, egui::TouchPhase::Move, 140.0, 220.0), moved(140.0, 220.0)]);
-        s.apply(&mut raw, Default::default());
+        s.apply_at(&mut raw, Default::default(), ms(t0, 30));
+        assert_eq!(presses(&raw), vec![true], "moving past the slop releases the press");
+        let i_press = raw.events.iter().position(|e| matches!(e, egui::Event::PointerButton { .. })).unwrap();
+        let i_move = raw.events.iter().position(|e| matches!(e, egui::Event::PointerMoved(_))).unwrap();
+        assert!(i_press < i_move, "press first, then the drag");
         assert!(wheels(&raw).is_empty(), "one finger does not scroll");
-        assert!(raw.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))), "and the drag reaches the app as a pointer drag");
     }
 
     #[test]
-    fn two_fingers_scroll_and_the_press_is_dropped() {
-        let mut s = TouchScroll::default();
-        // Finger one lands (the emulated press is what selects on a tablet).
-        let mut raw = batch(vec![touch(1, egui::TouchPhase::Start, 100.0, 100.0), press(100.0, 100.0)]);
-        s.apply(&mut raw, Default::default());
-        // Finger two lands: no scroll yet — the centroid jumped, but nothing has moved.
+    fn a_held_finger_starts_a_drag_after_the_hold() {
+        let (mut s, t0) = (TouchScroll::default(), Instant::now());
+        s.apply_at(&mut batch(vec![touch(1, egui::TouchPhase::Start, 100.0, 100.0), moved(100.0, 100.0), button(100.0, 100.0, true)]), Default::default(), t0);
+        assert!(s.repaint_after().is_some());
+        let mut raw = batch(vec![]);
+        s.apply_at(&mut raw, Default::default(), ms(t0, 200));
+        assert_eq!(presses(&raw), vec![true]);
+    }
+
+    #[test]
+    fn two_fingers_scroll_both_ways_and_never_select() {
+        let (mut s, t0) = (TouchScroll::default(), Instant::now());
+        s.apply_at(&mut batch(vec![touch(1, egui::TouchPhase::Start, 100.0, 100.0), moved(100.0, 100.0), button(100.0, 100.0, true)]), Default::default(), t0);
         let mut raw = batch(vec![touch(2, egui::TouchPhase::Start, 200.0, 100.0)]);
-        s.apply(&mut raw, Default::default());
-        assert!(wheels(&raw).is_empty(), "a second finger landing is not a scroll");
-        // Both drag down 30 points: the page moves down 30, and no press comes with it.
-        let mut raw = batch(vec![
-            touch(1, egui::TouchPhase::Move, 100.0, 130.0),
-            touch(2, egui::TouchPhase::Move, 200.0, 130.0),
-            moved(100.0, 130.0),
-            press(100.0, 130.0),
-        ]);
-        s.apply(&mut raw, Default::default());
+        s.apply_at(&mut raw, Default::default(), ms(t0, 40));
+        assert!(presses(&raw).is_empty() && wheels(&raw).is_empty(), "the held press is dropped, nothing scrolls yet");
+        // Diagonal: 30 right, 30 down.
+        let mut raw = batch(vec![touch(1, egui::TouchPhase::Move, 130.0, 130.0), touch(2, egui::TouchPhase::Move, 230.0, 130.0), moved(130.0, 130.0)]);
+        s.apply_at(&mut raw, Default::default(), ms(t0, 300));
         let w = wheels(&raw);
-        assert_eq!(w.len(), 1, "one wheel event per frame");
-        assert!((w[0].0.y - 30.0).abs() < 1e-3, "the content follows the fingers: {:?}", w[0].0);
-        assert_eq!(w[0].1, egui::TouchPhase::Move);
-        assert!(!raw.events.iter().any(|e| matches!(e, egui::Event::PointerButton { .. })), "no selection drag while scrolling");
-        assert!(raw.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))), "the pointer position stays: the apps only scroll while the pointer is over the canvas");
-        // Both lift: the release the apps coast from.
-        let mut raw = batch(vec![
-            touch(1, egui::TouchPhase::End, 100.0, 130.0),
-            touch(2, egui::TouchPhase::End, 200.0, 130.0),
-        ]);
-        s.apply(&mut raw, Default::default());
-        let w = wheels(&raw);
-        assert_eq!(w.len(), 1, "the fingers lifting is reported");
-        assert_eq!(w[0].1, egui::TouchPhase::End);
-        assert_eq!(w[0].0, egui::Vec2::ZERO, "a lift carries no distance of its own");
-        // And the next frame is quiet: one release, not one per frame.
-        let mut raw = batch(vec![touch(1, egui::TouchPhase::Start, 100.0, 100.0)]);
-        s.apply(&mut raw, Default::default());
-        assert!(wheels(&raw).is_empty());
+        assert_eq!(w.len(), 1);
+        assert!((w[0].0 - egui::vec2(30.0, 30.0)).length() < 1e-3, "horizontal and vertical: {:?}", w[0].0);
+        assert!(presses(&raw).is_empty() && !raw.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))), "the pointer stays still");
+        // Second finger lifts first; the first keeps moving: still no selection.
+        let mut raw = batch(vec![touch(2, egui::TouchPhase::End, 230.0, 130.0)]);
+        s.apply_at(&mut raw, Default::default(), ms(t0, 320));
+        assert_eq!(wheels(&raw), vec![(egui::Vec2::ZERO, egui::TouchPhase::End)], "the lift ends the scroll once");
+        let mut raw = batch(vec![touch(1, egui::TouchPhase::Move, 160.0, 200.0), moved(160.0, 200.0)]);
+        s.apply_at(&mut raw, Default::default(), ms(t0, 600));
+        assert!(presses(&raw).is_empty() && !raw.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))));
+        let mut raw = batch(vec![touch(1, egui::TouchPhase::End, 160.0, 200.0), button(160.0, 200.0, false), egui::Event::PointerGone]);
+        s.apply_at(&mut raw, Default::default(), ms(t0, 620));
+        assert!(presses(&raw).is_empty());
+        // Next touch is a fresh start.
+        let mut raw = batch(vec![touch(3, egui::TouchPhase::Start, 50.0, 50.0), moved(50.0, 50.0), button(50.0, 50.0, true), touch(3, egui::TouchPhase::End, 50.0, 50.0), button(50.0, 50.0, false)]);
+        s.apply_at(&mut raw, Default::default(), ms(t0, 900));
+        assert_eq!(presses(&raw), vec![true, false]);
     }
 
     #[test]
-    fn a_pinch_does_not_scroll_the_page() {
-        let mut s = TouchScroll::default();
-        s.apply(&mut batch(vec![touch(1, egui::TouchPhase::Start, 400.0, 400.0), touch(2, egui::TouchPhase::Start, 500.0, 400.0)]), Default::default());
-        // Fingers move apart around a fixed centre: that is egui's zoom_delta, not a scroll.
+    fn a_late_second_finger_ends_the_drag() {
+        let (mut s, t0) = (TouchScroll::default(), Instant::now());
+        s.apply_at(&mut batch(vec![touch(1, egui::TouchPhase::Start, 100.0, 100.0), moved(100.0, 100.0), button(100.0, 100.0, true)]), Default::default(), t0);
+        s.apply_at(&mut batch(vec![]), Default::default(), ms(t0, 200));
+        let mut raw = batch(vec![touch(2, egui::TouchPhase::Start, 200.0, 100.0)]);
+        s.apply_at(&mut raw, Default::default(), ms(t0, 400));
+        assert_eq!(presses(&raw), vec![false], "the selection drag is released");
+    }
+
+    #[test]
+    fn a_pinch_does_not_scroll() {
+        let (mut s, t0) = (TouchScroll::default(), Instant::now());
+        s.apply_at(&mut batch(vec![touch(1, egui::TouchPhase::Start, 400.0, 400.0), touch(2, egui::TouchPhase::Start, 500.0, 400.0)]), Default::default(), t0);
         let mut raw = batch(vec![touch(1, egui::TouchPhase::Move, 300.0, 400.0), touch(2, egui::TouchPhase::Move, 600.0, 400.0)]);
-        s.apply(&mut raw, Default::default());
-        assert!(wheels(&raw).is_empty(), "a pinch zooms, it does not scroll: {:?}", wheels(&raw));
-        assert!(raw.events.iter().any(|e| matches!(e, egui::Event::Touch { .. })), "the touch events stay in the batch, egui reads them for zoom");
+        s.apply_at(&mut raw, Default::default(), ms(t0, 20));
+        assert!(wheels(&raw).is_empty());
+        assert!(raw.events.iter().any(|e| matches!(e, egui::Event::Touch { .. })), "egui still sees the touches for zoom");
     }
 }
